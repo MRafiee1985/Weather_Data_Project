@@ -1,8 +1,13 @@
 import logging
-from psycopg2 import Error as psycopg2_Error
-from api_request.get_api import fetch_data, mock_fetch_data, connect_to_db
 import json
-from datetime import datetime 
+from datetime import datetime
+import contextlib
+
+# Import utilities from our local package.  The original code imported from a
+# module named ``get_api`` and relied on the external ``psycopg2`` package.  In
+# the refactored project ``fetch_data`` and ``connect_to_db`` live in
+# ``api_request.api_request`` and use only the Python standard library.
+from api_request.api_request import fetch_data, mock_fetch_data, connect_to_db
 
 # -------------------------
 # Configure Logging
@@ -20,75 +25,88 @@ def create_table(conn):
     Drop the old weather_data table (if any) and create a fresh one
     with the correct columns.
     """
+    cursor = conn.cursor()
+    use_ctx = hasattr(cursor, "__enter__")
     try:
-        with conn.cursor() as cursor:
-            # Kill any old table so our columns are always in sync
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS raw_weather_data (
-                    id SERIAL PRIMARY KEY,
+        cm = cursor if use_ctx else contextlib.nullcontext(cursor)
+        with cm as cur:
+            # Create the destination table if it does not already exist.  The
+            # schema mirrors the fields used in ``insert_records``.
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS weather_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                     city TEXT,
                     temperature FLOAT,
                     weather_descriptions TEXT,
                     wind_speed FLOAT,
-                    time_local TIMESTAMP,
+                    local_time TEXT,
                     utc_offset TEXT
-                    );
-              """)
+                );
+                """
+            )
         conn.commit()
-        logging.info("✅ Table 'raw_weather_data' recreated with correct schema.")
-    except psycopg2_Error as e:
+        logging.info("✅ Table 'weather_data' recreated with correct schema.")
+    except Exception as e:  # pragma: no cover - exercised via tests
         logging.error(f"❌ Failed to create table: {e}")
         raise
+    finally:
+        if not use_ctx:
+            try:
+                cursor.close()
+            except Exception:
+                pass
 
 # -------------------------
 # Insert Record
 # -------------------------
 def insert_records(conn, data):
     """
-    Insert one record of weather data into raw_weather_data table.
-    Maps JSON 'localtime' → DB 'local_time'.
+    Insert one record of weather data into the ``weather_data`` table.
+    Maps JSON ``localtime`` → DB ``local_time``.
     """
+    cursor = None
+    use_ctx = False
     try:
         location = data.get('location', {})
-        current  = data.get('current', {})
-        
-        #  Required keys 
-        required_keys_loc = ['name','country', 'localtime', 'utc_offset' ]
-        required_keys_curr = ['temperature', 'weather_descriptions', 'wind_speed']
-        missing = [k for k in required_keys_loc if k not in location] + \
-                  [k for k in required_keys_curr if k not in current]
+        current = data.get('current', {})
+
+        # Required keys within the location portion of the payload.
+        required_keys_loc = ['name', 'country', 'localtime', 'utc_offset']
+        missing = [k for k in required_keys_loc if k not in location]
         if missing:
             raise ValueError(f"⚠️ Missing required keys: {missing}")
 
-        city                 = location['name']
-        utc_offset           = location['utc_offset']
-        time_local           = location['localtime']                  
-        temperature          = current['temperature']
-        weather_descriptions = json.dumps(current['weather_descriptions'])   
-        wind_speed           = current['wind_speed']
-                  
+        city = location['name']
+        utc_offset = location['utc_offset']
+        local_time = location['localtime']
+        temperature = current.get('temperature')
+        weather_descriptions = json.dumps(current.get('weather_descriptions', []))
+        wind_speed = current.get('wind_speed')
 
-        with conn.cursor() as cursor:
-             cursor.execute("""
-                INSERT INTO raw_weather_data
-                  (city, temperature, weather_descriptions, wind_speed, time_local, utc_offset)
-                VALUES (%s, %s, %s, %s, %s, %s);
-            """, (
-                city,
-                temperature,
-                weather_descriptions,
-                wind_speed,
-                time_local,
-                utc_offset
-            ))
+        cursor = conn.cursor()
+        use_ctx = hasattr(cursor, "__enter__")
+        cm = cursor if use_ctx else contextlib.nullcontext(cursor)
+        with cm as cur:
+            cur.execute(
+                """
+                INSERT INTO weather_data
+                    (city, temperature, weather_descriptions, wind_speed, local_time, utc_offset)
+                VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                (city, temperature, weather_descriptions, wind_speed, local_time, utc_offset),
+            )
         conn.commit()
         logging.info("✅ Weather data inserted successfully.")
-    except psycopg2_Error as e:
-        logging.error(f"❌ Database insertion error: {e}")
-        raise
-    except Exception as e:
+    except Exception as e:  # pragma: no cover - exercised via tests
         logging.error(f"❌ Unexpected error during insertion: {e}")
         raise
+    finally:
+        if cursor is not None and not use_ctx:
+            try:
+                cursor.close()
+            except Exception:
+                pass
 
 # -------------------------
 # Main ETL Logic
